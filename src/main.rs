@@ -253,6 +253,10 @@ fn is_common_connection_error(err: &dyn std::error::Error) -> bool {
     s.contains("NotConnected") ||
     s.contains("TimedOut") ||
     s.contains("IncompleteMessage") ||
+    // A client (or health checker) opened a connection and never sent
+    // headers before hyper's header read timeout — routine idle noise,
+    // not an operator-actionable failure.
+    s.contains("HeaderTimeout") ||
     // TLS noise from bots/scanners - normal on public servers
     s.contains("no server name") ||
     s.contains("corrupt message") ||
@@ -840,9 +844,19 @@ password = "admin"
         .enable_http1()
         .wrap_connector(connector);
 
-    // Create HTTP client for proxying with bounded pool settings
+    // Create HTTP client for proxying with bounded pool settings.
+    //
+    // pool_idle_timeout MUST stay below the shortest keep-alive of the
+    // backends we front. WolfStack's actix server closes idle
+    // connections after 2 seconds — with the previous 30s pool idle,
+    // every dashboard request that reused a 2–30s-old pooled socket hit
+    // a connection the backend had already closed and 502'd with
+    // hyper's SendRequest/IncompleteMessage (wabil 2026-07-08). 1s
+    // keeps genuinely-hot connections pooled and discards the rest; the
+    // stale-connection retry in proxy_to_backend covers the residual
+    // race window.
     let http_client = HyperClient::builder(TokioExecutor::new())
-        .pool_idle_timeout(Duration::from_secs(30))       // Don't hold idle connections too long
+        .pool_idle_timeout(Duration::from_secs(1))
         .pool_max_idle_per_host(32)                        // Bounded idle connections per backend
         .retry_canceled_requests(true)                     // Retry if connection was closed
         .set_host(false)                                   // We set Host header ourselves
@@ -1766,7 +1780,50 @@ async fn handle_proxy(
 
         debug!("Proxying {} {} -> {}", method, original_uri, uri);
 
-        match state.http_client.request(proxy_req).await {
+        let mut send_result = state.http_client.request(proxy_req).await;
+
+        // Stale pooled connection: the backend closed a kept-alive socket
+        // (its keep-alive is shorter than our pool idle — WolfStack's is
+        // 2s) and hyper only finds out when the reused connection dies
+        // before a response arrives (SendRequest / IncompleteMessage).
+        // The request body is fully buffered above, so replaying it once
+        // on a FRESH connection is safe and invisible to the client;
+        // without this, dashboard polls through wolfproxy 502
+        // intermittently (wabil 2026-07-08).
+        if let Err(e) = &send_result {
+            let raw = format!("{:?}", e);
+            if raw.contains("IncompleteMessage") || raw.contains("SendRequest") {
+                debug!("Stale pooled connection to {} ({}), retrying once on a fresh connection", backend_addr, raw);
+                // Rebuild the identical request (the first one was consumed).
+                let mut retry_builder = hyper::Request::builder()
+                    .method(method.clone())
+                    .uri(&uri)
+                    .version(hyper::Version::HTTP_11);
+                for (name, value) in headers.iter() {
+                    let name_str = name.as_str().to_lowercase();
+                    if name_str == "host" || name_str == "connection" || name_str == "keep-alive" ||
+                       name_str == "transfer-encoding" || name_str == "te" || name_str == "trailer" ||
+                       name_str == "upgrade" || name_str == "proxy-authorization" || name_str == "proxy-connection" ||
+                       name_str == "content-length" {
+                        continue;
+                    }
+                    retry_builder = retry_builder.header(name, value);
+                }
+                for (name, value) in &custom_headers {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if let (Ok(hv), Ok(hn)) = (HeaderValue::from_str(value), HeaderName::from_str(name)) {
+                        retry_builder = retry_builder.header(hn, hv);
+                    }
+                }
+                if let Ok(retry_req) = retry_builder.body(Full::new(body_bytes.clone())) {
+                    send_result = state.http_client.request(retry_req).await;
+                }
+            }
+        }
+
+        match send_result {
             Ok(r) => {
                 if let Some(ref b) = backend_opt {
                     b.record_success();
