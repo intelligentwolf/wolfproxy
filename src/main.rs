@@ -749,11 +749,17 @@ password = "admin"
     let mut default_ssl_cert: Option<Arc<CertifiedKey>> = None;
     let mut http_ports: Vec<u16> = Vec::new();
     let mut https_ports: Vec<u16> = Vec::new();
+    // Every server_name seen on each port, split by plain/SSL, so a port that
+    // sites disagree on can be reported by name rather than as a bind failure.
+    let mut port_claims: HashMap<u16, (Vec<String>, Vec<String>)> = HashMap::new();
     
     for server in &nginx_config.servers {
         let vhost_list = VirtualHost::from_server_block(server);
         
         for vhost in vhost_list {
+            let claim = port_claims.entry(vhost.port).or_default();
+            let names = if vhost.ssl { &mut claim.1 } else { &mut claim.0 };
+            names.push(vhost.server_names.join(" "));
             // Track ports
             if vhost.ssl {
                 if !https_ports.contains(&vhost.port) {
@@ -916,8 +922,25 @@ password = "admin"
         ).await;
     }));
 
-    // Ensure we have at least the default ports
-    if http_ports.is_empty() {
+    // One socket cannot speak both plain HTTP and TLS. SSL wins the port (see
+    // the classification above), so the plain sites on it are not served —
+    // say which sites, because a stray `listen 80 ssl` or a bare
+    // `listen [::] ssl` (nginx reads that as port 80) is the usual cause and
+    // the operator has to find it in their config (klas, 2026-10-12).
+    for (port, (plain, ssl)) in &port_claims {
+        if !plain.is_empty() && !ssl.is_empty() {
+            error!("Port {} is configured as SSL by [{}] but as plain HTTP by [{}]. It will \
+                    serve SSL only, so the plain-HTTP sites on it are unreachable. Check the \
+                    listen lines of the SSL sites: `listen {} ssl`, or `listen [::] ssl` with \
+                    no port (which means port 80), is usually a mistake for 443",
+                   port, ssl.join(", "), plain.join(", "), port);
+        }
+    }
+
+    // Ensure we have at least the default HTTP port — unless an SSL site has
+    // already claimed it, in which case binding it again as plain HTTP would
+    // only fail against our own HTTPS listener.
+    if http_ports.is_empty() && !https_ports.contains(&config.server.http_port) {
         http_ports.push(config.server.http_port);
     }
 
